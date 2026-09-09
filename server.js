@@ -4,6 +4,7 @@ const path = require('path');
 const multer = require('multer');
 require('dotenv').config();
 const { Pool } = require('pg');
+const fs = require('fs');
 
 // Security & Optimization Imports
 const bcrypt = require('bcrypt');
@@ -16,21 +17,34 @@ const NodeCache = require('node-cache');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// 1. AUTO-CREATE UPLOADS FOLDER FOR RENDER
+if (!fs.existsSync('./uploads')) {
+  fs.mkdirSync('./uploads');
+}
+
 const apiCache = new NodeCache({ stdTTL: 15 });
 
 // --- SECURITY & OPTIMIZATION MIDDLEWARES ---
-app.use(helmet()); 
-app.use(cors()); 
+// 2. LOOSEN HELMET FOR IMAGE LOADING
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+})); 
 
-// 1. SECURE JSON PARSER: Reverted to 2mb to protect RAM
+// 3. ALLOW VERCEL TO CONNECT
+app.use(cors({
+  origin: '*', 
+  credentials: true
+})); 
+
+// SECURE JSON PARSER: Reverted to 2mb to protect RAM
 app.use(express.json({ limit: '2mb' })); 
 app.use(express.urlencoded({ limit: '2mb', extended: true }));
 app.use(compression()); 
 
-// 2. EXPOSE UPLOADS: Allow React to fetch the saved images
+// EXPOSE UPLOADS: Allow React to fetch the saved images
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// 3. MULTER CONFIGURATION: Stream files directly to disk
+// MULTER CONFIGURATION: Stream files directly to disk
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/'); 
@@ -130,7 +144,6 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
 });
 
 // --- RESCUE DISPATCH ROUTES ---
-// 4. UPDATED RESCUE ROUTE: Uses multer's upload.single('image')
 app.post('/api/cases/report', verifyToken, upload.single('image'), async (req, res) => {
   try {
     const { location, description } = req.body;
@@ -224,4 +237,4 @@ app.put('/api/cases/:id/status', verifyToken, async (req, res) => {
   }
 });
 
-app.listen(port, () => console.log(`🚀 Secure API Gateway running on http://localhost:${port}`));
+app.listen(port, () => console.log(`🚀 Secure API Gateway running on port ${port}`));
