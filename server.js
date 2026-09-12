@@ -1,10 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
-const multer = require('multer');
 require('dotenv').config();
 const { Pool } = require('pg');
-const fs = require('fs');
 
 // Security & Optimization Imports
 const bcrypt = require('bcrypt');
@@ -17,53 +14,23 @@ const NodeCache = require('node-cache');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// 1. AUTO-CREATE UPLOADS FOLDER FOR RENDER
-if (!fs.existsSync('./uploads')) {
-  fs.mkdirSync('./uploads');
-}
-
 const apiCache = new NodeCache({ stdTTL: 15 });
 
 // --- SECURITY & OPTIMIZATION MIDDLEWARES ---
-// 2. LOOSEN HELMET FOR IMAGE LOADING
-app.use(helmet({
-  crossOriginResourcePolicy: { policy: "cross-origin" }
-})); 
+app.use(helmet()); 
+app.use(cors()); 
 
-// 3. ALLOW VERCEL TO CONNECT
-app.use(cors({
-  origin: '*', 
-  credentials: true
-})); 
+// UPDATED: Payload limit decreased to 10mb for better performance and security
+app.use(express.json({ limit: '10mb' })); 
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// SECURE JSON PARSER: Reverted to 2mb to protect RAM
-app.use(express.json({ limit: '2mb' })); 
-app.use(express.urlencoded({ limit: '2mb', extended: true }));
 app.use(compression()); 
-
-// EXPOSE UPLOADS: Allow React to fetch the saved images
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// MULTER CONFIGURATION: Stream files directly to disk
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/'); 
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, 'rescue-' + uniqueSuffix + path.extname(file.originalname));
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 15 * 1024 * 1024 } // 15MB hard limit
-});
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, 
-  max: 10, 
-  message: { error: 'Too many authentication attempts. Please try again later.' }
+  max: 100, 
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+  validate: { xForwardedForHeader: false } // Stops the fatal Render crash
 });
 
 // --- DATABASE CONNECTION ---
@@ -144,45 +111,40 @@ app.get('/api/auth/me', verifyToken, async (req, res) => {
 });
 
 // --- RESCUE DISPATCH ROUTES ---
-app.post('/api/cases/report', verifyToken, upload.single('image'), async (req, res) => {
+app.post('/api/cases/report', verifyToken, async (req, res) => {
+  const { location, description, imageBase64 } = req.body;
+  const reporterId = req.user.id;
+
   try {
-    const { location, description } = req.body;
-    const parsedLocation = JSON.parse(location); 
-    const reporterId = req.user.id;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'Please upload an image.' });
-    }
-
-    const imagePath = `/uploads/${req.file.filename}`;
-
-    const lat = parsedLocation.lat || null;
-    const lng = parsedLocation.lng || null;
-    const manualAddress = parsedLocation.address || null;
-    const isCustom = parsedLocation.isCustom || parsedLocation.isManual || false;
+    const lat = location.lat || null;
+    const lng = location.lng || null;
+    const manualAddress = location.address || null;
+    const isCustom = location.isCustom || location.isManual || false;
 
     const result = await pool.query(
       `INSERT INTO rescue_cases (issue_description, latitude, longitude, manual_address, is_custom_location, image_payload, reporter_id) 
       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, status`,
-      [description, lat, lng, manualAddress, isCustom, imagePath, reporterId]
+      [description, lat, lng, manualAddress, isCustom, imageBase64, reporterId]
     );
     
     apiCache.flushAll(); 
     
     res.json({ success: true, case: result.rows[0] });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: 'Failed to submit rescue case' });
   }
 });
 
 app.get('/api/cases/map', async (req, res) => {
   try {
-    if (apiCache.has('map_data')) return res.json(apiCache.get('map_data'));
+    if (apiCache.has('map_data')) {
+      return res.json(apiCache.get('map_data'));
+    }
 
     const result = await pool.query(
       `SELECT id, species, issue_description, priority, latitude, longitude 
-       FROM rescue_cases WHERE status != 'Resolved' AND latitude IS NOT NULL AND longitude IS NOT NULL`
+       FROM rescue_cases 
+       WHERE status != 'Resolved' AND latitude IS NOT NULL AND longitude IS NOT NULL`
     );
     
     apiCache.set('map_data', result.rows);
@@ -194,7 +156,9 @@ app.get('/api/cases/map', async (req, res) => {
 
 app.get('/api/cases', verifyToken, async (req, res) => {
   try {
-    if (apiCache.has('dashboard_data')) return res.json(apiCache.get('dashboard_data'));
+    if (apiCache.has('dashboard_data')) {
+      return res.json(apiCache.get('dashboard_data'));
+    }
 
     const result = await pool.query(
       `SELECT id, species, issue_description, priority, status, manual_address, latitude, longitude, assigned_volunteer_id, created_at 
@@ -231,10 +195,46 @@ app.put('/api/cases/:id/status', verifyToken, async (req, res) => {
     if (result.rows.length === 0) return res.status(403).json({ error: 'Action denied' });
 
     apiCache.flushAll();
+
     res.json({ success: true, case: result.rows[0] });
   } catch (err) {
     res.status(500).json({ error: 'Failed to update case status' });
   }
 });
 
-app.listen(port, () => console.log(`🚀 Secure API Gateway running on port ${port}`));
+// --- NEW VERIFICATION ROUTE ---
+app.post('/api/cases/:id/resolve', verifyToken, async (req, res) => {
+  const { id } = req.params;
+  const { resolutionImageBase64, resolutionNotes } = req.body;
+  const userId = req.user.id;
+  const userRole = req.user.role; 
+
+  try {
+    // NGOs get auto-verified. Volunteers require admin review.
+    const newVerificationStatus = userRole === 'ngo' ? 'Auto-Verified' : 'Pending Admin Review';
+
+    const result = await pool.query(
+      `UPDATE rescue_cases 
+       SET status = 'Resolved', 
+           resolution_image_payload = $1, 
+           resolution_notes = $2, 
+           verification_status = $3
+       WHERE id = $4 AND assigned_volunteer_id = $5 
+       RETURNING *`,
+      [resolutionImageBase64, resolutionNotes, newVerificationStatus, id, userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(403).json({ error: 'Action denied. You are not assigned to this case.' });
+    }
+
+    apiCache.flushAll();
+
+    res.json({ success: true, case: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to submit resolution evidence' });
+  }
+});
+
+app.listen(port, () => console.log(`🚀 Secure & Optimized API Gateway running on http://localhost:${port}`));
