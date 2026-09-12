@@ -21,8 +21,8 @@ app.use(helmet());
 app.use(cors()); 
 
 // UPDATED: Payload limit decreased to 10mb for better performance and security
-app.use(express.json({ limit: '10mb' })); 
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: '50mb' })); 
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use(compression()); 
 
